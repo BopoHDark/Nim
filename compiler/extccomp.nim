@@ -719,8 +719,20 @@ template tryExceptOSErrorMessage(conf: ConfigRef; errorPrefix: string = "", body
 
 proc execLinkCmd(conf: ConfigRef; linkCmd: string) =
   tryExceptOSErrorMessage(conf, "invocation of external linker program failed."):
-    execExternalProgram(conf, linkCmd,
-      if optListCmd in conf.globalOptions or conf.verbosity > 1: hintExecuting else: hintLinking)
+    when defined(windows):
+      # workaround for windows command line arguments limit (32_767)
+      let cmdFile = conf.projectFull & "_cc_linker_cmd"
+      let ccExeIdx = linkCmd.find(" ")
+      let ccExe = linkCmd[0 ..< ccExeIdx]
+      let cmdFileData = escape(linkCmd[ccExeIdx .. ^1], "", "")
+      writeFile(cmdFile, cmdFileData)
+      var linkCmd = ccExe & " @" & cmdFile
+      execExternalProgram(conf, linkCmd,
+        if optListCmd in conf.globalOptions or conf.verbosity > 1: hintExecuting else: hintLinking)
+      discard tryRemoveFile(cmdFile)
+    else:
+      execExternalProgram(conf, linkCmd,
+        if optListCmd in conf.globalOptions or conf.verbosity > 1: hintExecuting else: hintLinking)
 
 proc execCmdsInParallel(conf: ConfigRef; cmds: seq[string]; prettyCb: proc (idx: int)) =
   let runCb = proc (idx: int, p: Process) =
