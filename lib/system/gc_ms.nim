@@ -506,6 +506,9 @@ when not defined(useNimRtl):
     gch.cycleThreshold = high(gch.cycleThreshold)-1
     # set to the max value to suppress the cycle detector
 
+  proc GC_objectShouldBeCollectedSoon(o: ref) =
+    discard
+
   when defined(nimTracing):
     proc GC_logTrace*() =
       gch.tracing = true

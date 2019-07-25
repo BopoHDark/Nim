@@ -716,6 +716,7 @@ when not defined(useNimRtl):
 
   proc GC_enableMarkAndSweep() = discard
   proc GC_disableMarkAndSweep() = discard
+  proc GC_objectShouldBeCollectedSoon(o: ref) = discard
 
   proc GC_fullCollect() =
     var oldThreshold = gch.cycleThreshold

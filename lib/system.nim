@@ -143,7 +143,7 @@ when defined(nimHasRunnableExamples):
     ##       assert double(5) == 10
     ##       block: ## at block scope
     ##         defer: echo "done"
-    ##   
+    ##
     ##     result = 2 * x
 else:
   template runnableExamples*(body: untyped) =
@@ -3264,6 +3264,9 @@ when not defined(nimscript) and hasAlloc:
 
     template GC_enableMarkAndSweep* =
       {.warning: "GC_enableMarkAndSweep is a no-op in JavaScript".}
+
+    template GC_objectShouldBeCollectedSoon* =
+      {.warning: "GC_objectShouldBeCollectedSoon is a no-op in JavaScript".}
 
     template GC_disableMarkAndSweep* =
       {.warning: "GC_disableMarkAndSweep is a no-op in JavaScript".}
