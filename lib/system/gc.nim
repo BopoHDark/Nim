@@ -27,6 +27,10 @@ when withRealTime and not declared(getTicks):
 when defined(memProfiler):
   proc nimProfile(requestedSize: int) {.benign.}
 
+
+when defined(leakDetector):
+  import ansi_c
+
 when hasThreadSupport:
   import sharedlist
 
@@ -91,12 +95,22 @@ type
     stat: GcStat
     marked: CellSet
     additionalRoots: CellSeq # dummy roots for GC_ref/unref
+    when leakDetector:
+      debugCell: PCell
+      debugCellTraced: bool
+      markStack: CellSeq
     when hasThreadSupport:
       toDispose: SharedList[pointer]
     gcThreadId: int
 
 var
   gch {.rtlThreadVar.}: GcHeap
+
+template pushMarkStack(p: PCell, name: cstring = nil) =
+  when leakDetector: gch.markStack.add(p)
+
+template popMarkStack() =
+  when leakDetector: dec gch.markStack.len
 
 when not defined(useNimRtl):
   instantiateForRegion(gch.region)
@@ -113,7 +127,7 @@ template gcAssert(cond: bool, msg: string) =
       writeStackTrace()
       #var x: ptr int
       #echo x[]
-      quit 1
+      c_abort()
 
 proc addZCT(s: var CellSeq, c: PCell) {.noinline.} =
   if (c.refcount and ZctFlag) == 0:
@@ -146,7 +160,7 @@ template setColor(c, col) =
   else:
     c.refcount = c.refcount and not colorMask or col
 
-when defined(logGC):
+when defined(logGC) or defined(leakDetector):
   proc writeCell(msg: cstring, c: PCell) =
     var kind = -1
     var typName: cstring = "nil"
@@ -157,10 +171,10 @@ when defined(logGC):
           typName = c.typ.name
 
     when leakDetector:
-      c_fprintf(stdout, "[GC] %s: %p %d %s rc=%ld from %s(%ld)\n",
+      c_fprintf(cstdout, "[GC] %s: %p %d %s rc=%ld from %s(%ld)\n",
                 msg, c, kind, typName, c.refcount shr rcShift, c.filename, c.line)
     else:
-      c_fprintf(stdout, "[GC] %s: %p %d %s rc=%ld; thread=%ld\n",
+      c_fprintf(cstdout, "[GC] %s: %p %d %s rc=%ld; thread=%ld\n",
                 msg, c, kind, typName, c.refcount shr rcShift, gch.gcThreadId)
 
 template logCell(msg: cstring, c: PCell) =
@@ -276,6 +290,7 @@ proc initGC() =
     init(gch.decStack)
     init(gch.marked)
     init(gch.additionalRoots)
+    when leakDetector: init(gch.markStack)
     when hasThreadSupport:
       init(gch.toDispose)
     gch.gcThreadId = atomicInc(gHeapidGenerator) - 1
@@ -326,6 +341,7 @@ proc forAllChildren(cell: PCell, op: WalkOp) =
   gcAssert(isAllocatedPtr(gch.region, cell), "forAllChildren: pointer not part of the heap")
   gcAssert(cell.typ != nil, "forAllChildren: cell.typ is nil")
   gcAssert cell.typ.kind in {tyRef, tySequence, tyString}, "forAllChildren: unknown GC'ed type"
+  pushMarkStack(cell)
   let marker = cell.typ.marker
   if marker != nil:
     marker(cellToUsr(cell), op.int)
@@ -341,6 +357,8 @@ proc forAllChildren(cell: PCell, op: WalkOp) =
           forAllChildrenAux(cast[pointer](d +% i *% cell.typ.base.size +%
             GenericSeqSize), cell.typ.base, op)
     else: discard
+
+  popMarkStack()
 
 proc addNewObjToZCT(res: PCell, gch: var GcHeap) {.inline.} =
   # we check the last 8 entries (cache line) for a slot that could be reused.
@@ -396,8 +414,12 @@ proc gcInvariant*() =
 template setFrameInfo(c: PCell) =
   when leakDetector:
     if framePtr != nil and framePtr.prev != nil:
-      c.filename = framePtr.prev.filename
-      c.line = framePtr.prev.line
+      var fr = framePtr.prev
+      while not fr.prev.isNil and
+          (c_strcmp(fr.filename, "system.nim") == 0 or c_strcmp(fr.filename, "gc.nim") == 0):
+        fr = fr.prev
+      c.filename = fr.filename
+      c.line = fr.line
     else:
       c.filename = nil
       c.line = 0
@@ -571,10 +593,26 @@ proc sweep(gch: var GcHeap) =
       var c = cast[PCell](x)
       if c notin gch.marked: freeCyclicCell(gch, c)
 
+when leakDetector:
+  proc dumpMarkStack() =
+    if gch.markStack.len == 0:
+      c_fprintf(cstdout, "[GC] Mark stack is empty\n")
+      return
+
+    var i = gch.markStack.len - 1
+    writeCell("Found debug cell", gch.markStack.d[i])
+    dec i
+    while i >= 0:
+      writeCell("Referred by", gch.markStack.d[i])
+      dec i
+    c_fprintf(cstdout, "[GC] Referred by global or stack\n")
+
+
 proc markS(gch: var GcHeap, c: PCell) =
   gcAssert isAllocatedPtr(gch.region, c), "markS: foreign heap root detected A!"
   incl(gch.marked, c)
   gcAssert gch.tempStack.len == 0, "stack not empty!"
+  pushMarkStack(c)
   forAllChildren(c, waMarkPrecise)
   while gch.tempStack.len > 0:
     dec gch.tempStack.len
@@ -582,6 +620,7 @@ proc markS(gch: var GcHeap, c: PCell) =
     gcAssert isAllocatedPtr(gch.region, d), "markS: foreign heap root detected B!"
     if not containsOrIncl(gch.marked, d):
       forAllChildren(d, waMarkPrecise)
+  popMarkStack()
 
 proc markGlobals(gch: var GcHeap) =
   if gch.gcThreadId == 0:
@@ -610,7 +649,8 @@ when logGC:
     else:
       writeCell("cell {", s)
       forAllChildren(s, waDebug)
-      c_fprintf(stdout, "}\n")
+      c_fprintf(cstdout, "}\n")
+
 
 proc doOperation(p: pointer, op: WalkOp) =
   if p == nil: return
@@ -618,22 +658,30 @@ proc doOperation(p: pointer, op: WalkOp) =
   gcAssert(c != nil, "doOperation: 1")
   # the 'case' should be faster than function pointers because of easy
   # prediction:
+  pushMarkStack(c)
   case op
   of waZctDecRef:
     #if not isAllocatedPtr(gch.region, c):
-    #  c_fprintf(stdout, "[GC] decref bug: %p", c)
+    #  c_fprintf(cstdout, "[GC] decref bug: %p", c)
     gcAssert(isAllocatedPtr(gch.region, c), "decRef: waZctDecRef")
     gcAssert(c.refcount >=% rcIncrement, "doOperation 2")
     logCell("decref (from doOperation)", c)
     track("waZctDecref", p, 0)
     decRef(c)
   of waPush:
+    gcAssert isAllocatedPtr(gch.region, c), "waPush: foreign heap root detected!"
     add(gch.tempStack, c)
   of waMarkGlobal:
     markS(gch, c)
   of waMarkPrecise:
+    when leakDetector:
+      if c == gch.debugCell and not gch.debugCellTraced:
+        gch.debugCellTraced = true
+        dumpMarkStack()
+    gcAssert isAllocatedPtr(gch.region, c), "waMarkPrecise: foreign heap root detected!"
     add(gch.tempStack, c)
   #of waDebug: debugGraph(c)
+  popMarkStack()
 
 proc nimGCvisit(d: pointer, op: int) {.compilerRtl.} =
   doOperation(d, WalkOp(op))
@@ -641,6 +689,7 @@ proc nimGCvisit(d: pointer, op: int) {.compilerRtl.} =
 proc collectZCT(gch: var GcHeap): bool {.benign.}
 
 proc collectCycles(gch: var GcHeap) =
+  when leakDetector: gch.debugCellTraced = false
   when hasThreadSupport:
     for c in gch.toDispose:
       nimGCunref(c)
@@ -653,6 +702,10 @@ proc collectCycles(gch: var GcHeap) =
     markS(gch, d[i])
   markGlobals(gch)
   sweep(gch)
+  when leakDetector:
+    if gch.debugCell != nil and not gch.debugCellTraced:
+      c_fprintf(cstdout, "Debug cell %d not found in graph. Most likely disposed.\n")
+      gch.debugCell = nil
 
 proc gcMark(gch: var GcHeap, p: pointer) {.inline.} =
   # the addresses are not as cells on the stack, so turn them to cells:
@@ -665,6 +718,9 @@ proc gcMark(gch: var GcHeap, p: pointer) {.inline.} =
     if objStart != nil:
       # mark the cell:
       incRef(objStart)
+      when leakDetector:
+        if objStart == gch.debugCell:
+          c_fprintf(cstdout, "[CG] Debug cell found on stack\n")
       add(gch.decStack, objStart)
     when false:
       if isAllocatedPtr(gch.region, cell):
@@ -778,7 +834,7 @@ proc collectCTBody(gch: var GcHeap) =
     gch.stat.maxPause = max(gch.stat.maxPause, duration)
     when defined(reportMissedDeadlines):
       if gch.maxPause > 0 and duration > gch.maxPause:
-        c_fprintf(stdout, "[GC] missed deadline: %ld\n", duration)
+        c_fprintf(cstdout, "[GC] missed deadline: %ld\n", duration)
 
 proc collectCT(gch: var GcHeap) =
   if (gch.zct.len >= gch.zctThreshold or (cycleGC and
@@ -846,10 +902,16 @@ when not defined(useNimRtl):
     # set to the max value to suppress the cycle detector
 
   proc GC_fullCollect() =
+    echo "full collect"
     var oldThreshold = gch.cycleThreshold
     gch.cycleThreshold = 0 # forces cycle collection
     collectCT(gch)
     gch.cycleThreshold = oldThreshold
+
+  proc GC_objectShouldBeCollectedSoon*(o: ref) =
+    when leakDetector:
+      gch.debugCell = usrToCell(cast[pointer](o))
+      writeCell("Setting debug cell", gch.debugCell)
 
   proc GC_getStatistics(): string =
     result = "[GC] total memory: " & $(getTotalMem()) & "\n" &
