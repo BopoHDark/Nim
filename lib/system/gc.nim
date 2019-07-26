@@ -27,10 +27,6 @@ when withRealTime and not declared(getTicks):
 when defined(memProfiler):
   proc nimProfile(requestedSize: int) {.benign.}
 
-
-when defined(leakDetector):
-  import ansi_c
-
 when hasThreadSupport:
   import sharedlist
 
